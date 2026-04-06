@@ -223,13 +223,34 @@ impl LlmProvider {
 }
 
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LlmProvider {
     /// Direct Anthropic API (requires API key). Format: Anthropic Messages.
     Api,
-    /// OpenAI API (requires API key). Format: OpenAI Chat Completions.
+    /// OpenAI API (requires API key). Format: OpenAI Responses.
     Openai,
+}
+
+// Custom deserializer: migrate removed providers (claude_cli → api, codex → openai)
+impl<'de> serde::Deserialize<'de> for LlmProvider {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(deserializer)?;
+        match s.as_str() {
+            "api" => Ok(LlmProvider::Api),
+            "openai" => Ok(LlmProvider::Openai),
+            // Migration: removed providers fall back to their closest replacement
+            "claude_cli" | "cli" => {
+                log::warn!("migrating provider 'claude_cli' → 'api' (Claude CLI removed)");
+                Ok(LlmProvider::Api)
+            }
+            "codex" => {
+                log::warn!("migrating provider 'codex' → 'openai' (Codex removed)");
+                Ok(LlmProvider::Openai)
+            }
+            other => Err(serde::de::Error::unknown_variant(other, &["api", "openai"])),
+        }
+    }
 }
 
 impl LlmProvider {
