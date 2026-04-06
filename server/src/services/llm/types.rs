@@ -168,7 +168,6 @@ pub struct ToolChatResult {
 // ═══════════════════════════════════════════════════════════════════════════
 
 pub(crate) const ANTHROPIC_BASE_URL: &str = "https://api.anthropic.com";
-pub(crate) const BYOKEY_BASE_URL: &str = "http://127.0.0.1:8018";
 pub(crate) const OPENAI_BASE_URL: &str = "https://api.openai.com";
 
 #[derive(Clone)]
@@ -178,7 +177,7 @@ pub struct LlmBackend {
     pub model: String,
     /// Base URL for Anthropic API calls.
     pub base_url: String,
-    /// Provider type — Api (direct Anthropic) or ClaudeCli (via Meridian proxy).
+    /// Provider type — Api (Anthropic) or Openai.
     pub provider: crate::config::LlmProvider,
 }
 

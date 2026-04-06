@@ -22,11 +22,6 @@ pub fn router() -> Router<AppState> {
         .route("/api/config/github", put(update_github))
         .route("/api/config/server", get(get_server))
         .route("/api/config/server", put(update_server))
-        // Claude CLI OAuth
-        .route("/api/claude-cli/status", get(claude_cli_status))
-        .route("/api/claude-cli/oauth/start", get(claude_cli_oauth_start))
-        .route("/api/claude-cli/oauth/exchange", post(claude_cli_oauth_exchange))
-        .route("/api/claude-cli/byokey-status", get(byokey_provider_status))
 }
 
 async fn get_status(State(state): State<AppState>) -> Json<serde_json::Value> {
@@ -52,9 +47,7 @@ async fn get_status(State(state): State<AppState>) -> Json<serde_json::Value> {
 
     let provider = match config.llm.provider {
         config::LlmProvider::Api => "api",
-        config::LlmProvider::ClaudeCli => "claude_cli",
         config::LlmProvider::Openai => "openai",
-        config::LlmProvider::Codex => "codex",
     };
 
     Json(json!({
@@ -445,24 +438,9 @@ async fn update_provider(
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     let provider = match req.provider.as_str() {
         "api" | "anthropic" => config::LlmProvider::Api,
-        "claude_cli" | "cli" => config::LlmProvider::ClaudeCli,
         "openai" => config::LlmProvider::Openai,
-        "codex" => config::LlmProvider::Codex,
         other => return Err((StatusCode::BAD_REQUEST, format!("unknown provider: {other}"))),
     };
-
-    // Auto-install and start BYOKEY proxy when switching to subscription provider
-    if provider.is_proxy() {
-        if let Err(e) = crate::services::claude_cli::ensure_proxy_installed().await {
-            log::warn!("BYOKEY install failed: {e}");
-            return Err((StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to install Meridian: {e}")));
-        }
-        if !crate::services::claude_cli::is_proxy_running().await {
-            if let Err(e) = crate::services::claude_cli::start_proxy_detached(&state.workspace_dir).await {
-                log::warn!("BYOKEY start failed: {e}");
-            }
-        }
-    }
 
     {
         let mut cfg = state.config.write().await;
@@ -480,149 +458,4 @@ async fn update_provider(
     Ok(Json(json!({ "status": "ok", "provider": req.provider })))
 }
 
-// ---------------------------------------------------------------------------
-// Claude CLI status & OAuth
-// ---------------------------------------------------------------------------
-
-#[derive(Deserialize)]
-struct CliStatusQuery {
-    #[serde(default)]
-    instance_slug: Option<String>,
-}
-
-async fn claude_cli_status(
-    State(state): State<AppState>,
-    axum::extract::Query(query): axum::extract::Query<CliStatusQuery>,
-) -> Json<serde_json::Value> {
-    use crate::services::claude_cli;
-
-    let proxy_running = claude_cli::is_proxy_running().await;
-
-    let authenticated = query.instance_slug
-        .as_deref()
-        .map(|slug| claude_cli::has_valid_token(&state.workspace_dir, slug))
-        .unwrap_or(false);
-
-    Json(json!({
-        "proxy_running": proxy_running,
-        "authenticated": authenticated,
-    }))
-}
-
-/// Start OAuth PKCE flow — returns an authorization URL for the user to visit.
-async fn claude_cli_oauth_start(
-    State(_state): State<AppState>,
-) -> Json<serde_json::Value> {
-    use crate::services::claude_cli;
-
-    let oauth_state = claude_cli::initiate_oauth();
-    let auth_url = claude_cli::build_auth_url(&oauth_state);
-
-    // Store the PKCE state temporarily for the exchange step.
-    // We use a simple file since this is a short-lived flow (10 min).
-    let state_path = config::workspace_root().join(".claude_oauth_state.json");
-    if let Ok(json) = serde_json::to_string_pretty(&oauth_state) {
-        let _ = std::fs::write(&state_path, json);
-    }
-
-    Json(json!({
-        "auth_url": auth_url,
-    }))
-}
-
-#[derive(Deserialize)]
-struct OAuthExchangeRequest {
-    code: String,
-    instance_slug: String,
-}
-
-/// Exchange authorization code for tokens and store per-instance.
-async fn claude_cli_oauth_exchange(
-    State(state): State<AppState>,
-    Json(req): Json<OAuthExchangeRequest>,
-) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    use crate::services::claude_cli;
-
-    // Load PKCE state
-    let state_path = config::workspace_root().join(".claude_oauth_state.json");
-    let state_json = std::fs::read_to_string(&state_path)
-        .map_err(|e| (StatusCode::BAD_REQUEST, format!("No pending OAuth flow: {e}")))?;
-    let oauth_state: claude_cli::OAuthState = serde_json::from_str(&state_json)
-        .map_err(|e| (StatusCode::BAD_REQUEST, format!("Invalid OAuth state: {e}")))?;
-
-    // Install + start Meridian if needed
-    if let Err(e) = claude_cli::ensure_proxy_installed().await {
-        log::warn!("BYOKEY install failed during OAuth: {e}");
-    }
-    if !claude_cli::is_proxy_running().await {
-        let _ = claude_cli::start_proxy_detached(&state.workspace_dir).await;
-    }
-
-    // Exchange code for tokens
-    let http = reqwest::Client::new();
-    let tokens = claude_cli::exchange_code(&http, &req.code, &oauth_state)
-        .await
-        .map_err(|e| (StatusCode::BAD_GATEWAY, format!("OAuth exchange failed: {e}")))?;
-
-    // Save per-instance
-    let workspace = state.workspace_dir.clone();
-    claude_cli::save_token(&workspace, &req.instance_slug, &tokens)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to save token: {e}")))?;
-
-    // Write credentials for Claude Code SDK (used by Meridian)
-    // and restart Meridian so it picks up the new credentials
-    claude_cli::import_token_to_byokey(&tokens);
-    claude_cli::kill_proxy();
-    if let Err(e) = claude_cli::start_proxy_detached(&workspace).await {
-        log::warn!("Failed to restart BYOKEY after OAuth: {e}");
-    }
-
-    // Clean up state file
-    let _ = std::fs::remove_file(&state_path);
-
-    // Auto-switch provider to claude_cli and force LLM rebuild
-    {
-        let mut cfg = state.config.write().await;
-        cfg.llm.provider = config::LlmProvider::ClaudeCli;
-        let _ = save_config(&cfg);
-    }
-    // Force rebuild — reload_config compares old vs new, but we already
-    // changed the in-memory config above, so the diff would be empty.
-    {
-        let cfg = state.config.read().await;
-        let new_llm = crate::services::llm::LlmBackend::from_config(&cfg);
-        *state.llm.write().await = new_llm;
-        log::info!("LLM rebuilt after OAuth exchange (provider=ClaudeCli)");
-    }
-
-    Ok(Json(json!({
-        "status": "ok",
-        "expires_at": tokens.expires_at,
-    })))
-}
-
-/// Check which BYOKEY providers are authenticated.
-async fn byokey_provider_status() -> Json<serde_json::Value> {
-    let bin = crate::services::claude_cli::resolve_byokey_binary_pub();
-    let output = std::process::Command::new(&bin)
-        .arg("status")
-        .output();
-
-    let mut providers = serde_json::Map::new();
-    if let Ok(out) = output {
-        let text = String::from_utf8_lossy(&out.stdout);
-        for line in text.lines() {
-            let line = line.trim();
-            if let Some((name, status)) = line.split_once(':') {
-                let name = name.trim();
-                let authenticated = status.trim() == "authenticated";
-                if name != "server" {
-                    providers.insert(name.to_string(), serde_json::json!(authenticated));
-                }
-            }
-        }
-    }
-
-    Json(serde_json::json!({ "providers": providers }))
-}
 

@@ -31,10 +31,6 @@
 		fetchSuggestedMcp,
 		updateLlmConfig,
 		updateProvider,
-		fetchClaudeCliStatus,
-		startClaudeCliOAuth,
-		exchangeClaudeCliOAuth,
-		fetchByokeyStatus,
 		type ScheduledTask,
 	} from "$lib/api/client.js";
 	import type { McpServerInfo, EmailConfig } from "$lib/api/client.js";
@@ -405,12 +401,6 @@
 	let keyEditing = $state("");
 	let keyEditValue = $state("");
 
-	// Claude CLI OAuth state
-	let cliConnected = $state(false);
-	let cliOAuthCode = $state("");
-	let cliConnecting = $state(false);
-	let cliError = $state("");
-
 	$effect(() => {
 		fetchConfigStatus().then(s => {
 			if (s.model_mode) modelMode = s.model_mode;
@@ -419,26 +409,7 @@
 		}).catch(() => {});
 	});
 
-	// Check CLI token status when provider is claude_cli
-	$effect(() => {
-		if (provider === "claude_cli") {
-			fetchClaudeCliStatus(slug).then(s => {
-				cliConnected = s.authenticated;
-			}).catch(() => {});
-		}
-	});
-
-	// Check BYOKEY provider status for Codex
-	let codexConnected = $state(false);
-	$effect(() => {
-		if (provider === "codex") {
-			fetchByokeyStatus().then(s => {
-				codexConnected = s.providers?.codex ?? false;
-			}).catch(() => {});
-		}
-	});
-
-	async function setProvider(p: 'api' | 'claude_cli' | 'openai' | 'codex') {
+	async function setProvider(p: 'api' | 'openai') {
 		providerSaving = true;
 		try {
 			await updateProvider(p);
@@ -446,35 +417,6 @@
 		} catch {
 		} finally {
 			providerSaving = false;
-		}
-	}
-
-	async function startOAuth() {
-		cliConnecting = true;
-		cliError = "";
-		try {
-			const { auth_url } = await startClaudeCliOAuth();
-			window.open(auth_url, "_blank");
-		} catch (e) {
-			cliError = e instanceof Error ? e.message : "failed to start OAuth";
-		} finally {
-			cliConnecting = false;
-		}
-	}
-
-	async function submitOAuthCode() {
-		if (!cliOAuthCode.trim()) return;
-		cliConnecting = true;
-		cliError = "";
-		try {
-			await exchangeClaudeCliOAuth(cliOAuthCode.trim(), slug);
-			provider = "claude_cli";
-			cliConnected = true;
-			cliOAuthCode = "";
-		} catch (e) {
-			cliError = e instanceof Error ? e.message : "failed to exchange code";
-		} finally {
-			cliConnecting = false;
 		}
 	}
 
@@ -986,17 +928,8 @@
 				onclick={() => setProvider("api")}
 				disabled={providerSaving}
 			>
-				<span class="mode-name">API key</span>
+				<span class="mode-name">Anthropic</span>
 				<span class="mode-desc">pay-per-use with your own Anthropic API key</span>
-			</button>
-			<button
-				class="mode-option"
-				class:mode-active={provider === "claude_cli"}
-				onclick={() => setProvider("claude_cli")}
-				disabled={providerSaving}
-			>
-				<span class="mode-name">Claude Code</span>
-				<span class="mode-desc">use your Claude Pro/Max subscription</span>
 			</button>
 			<button
 				class="mode-option"
@@ -1007,78 +940,7 @@
 				<span class="mode-name">OpenAI</span>
 				<span class="mode-desc">pay-per-use with your own OpenAI API key</span>
 			</button>
-			<button
-				class="mode-option"
-				class:mode-active={provider === "codex"}
-				onclick={() => setProvider("codex")}
-				disabled={providerSaving}
-			>
-				<span class="mode-name">Codex</span>
-				<span class="mode-desc">use your ChatGPT Plus/Pro subscription</span>
-			</button>
 		</div>
-
-		{#if provider === "codex"}
-			<div class="cli-oauth-section">
-				{#if codexConnected}
-					<div class="cli-oauth-row" style="justify-content: space-between;">
-						<span class="key-badge key-badge-ok">connected</span>
-					</div>
-				{:else}
-					<p class="cli-instruction">Connect your ChatGPT Plus/Pro subscription via BYOKEY.</p>
-					<p class="cli-instruction" style="opacity: 0.7; font-size: 0.78rem;">
-						Run <code style="background: var(--surface-input); padding: 2px 6px; border-radius: 4px;">byokey login codex</code> in a terminal, then restart.
-					</p>
-				{/if}
-			</div>
-		{/if}
-
-		{#if provider === "claude_cli"}
-			<div class="cli-oauth-section">
-				{#if cliConnected}
-					<div class="cli-oauth-row" style="justify-content: space-between;">
-						<span class="key-badge key-badge-ok">connected</span>
-						<button
-							class="key-change"
-							onclick={() => { cliConnected = false; }}
-						>reconnect</button>
-					</div>
-				{:else}
-					<p class="cli-instruction">Connect your Claude account to use your subscription.</p>
-					<div class="cli-oauth-row">
-						<button
-							class="key-change key-change-add"
-							onclick={startOAuth}
-							disabled={cliConnecting}
-						>
-							{cliConnecting ? "opening..." : "connect with Claude"}
-						</button>
-					</div>
-					<p class="cli-instruction" style="margin-top: 0.75rem; opacity: 0.6; font-size: 0.8rem;">
-						After authorizing, paste the code below:
-					</p>
-					<div class="cli-oauth-row">
-						<input
-							type="text"
-							class="cli-code-input"
-							placeholder="paste authorization code"
-							bind:value={cliOAuthCode}
-							onkeydown={(e: KeyboardEvent) => { if (e.key === "Enter") submitOAuthCode(); }}
-						/>
-						<button
-							class="key-change"
-							onclick={submitOAuthCode}
-							disabled={!cliOAuthCode.trim() || cliConnecting}
-						>
-							{cliConnecting ? "..." : "submit"}
-						</button>
-					</div>
-					{#if cliError}
-						<p class="key-error">{cliError}</p>
-					{/if}
-				{/if}
-			</div>
-		{/if}
 	</section>
 
 	<!-- API Keys -->

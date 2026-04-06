@@ -7,8 +7,6 @@
 		setCompanionName,
 		fetchConfigStatus,
 		updateLlmConfig,
-		startClaudeCliOAuth,
-		exchangeClaudeCliOAuth,
 		updateProvider,
 	} from "$lib/api/client.js";
 	import type { SoulTemplate } from "$lib/api/types.js";
@@ -37,14 +35,9 @@
 		| "picking-skin"
 		| "picking-soul"
 		| "picking-provider"
-		| "claude-oauth"
 		| "waiting-first"
 		| "sending"
 		| "departing";
-
-	let oauthCode = $state("");
-	let oauthError = $state("");
-	let oauthConnecting = $state(false);
 
 	let stage = $state<Stage>("reveal");
 	let revealed = $state(false);
@@ -225,49 +218,6 @@
 		apiKeyInputEl?.focus();
 	}
 
-	async function pickProviderCodex() {
-		stage = "intro";
-		await typewrite("codex subscription — nice. you can set it up in settings after we're done.");
-		await pause(600);
-		// Set provider to codex, skip key input
-		try { await exchangeClaudeCliOAuth("", slug); } catch {}
-		await updateProvider("codex");
-		await askFirstMessage();
-	}
-
-	async function pickProviderClaude() {
-		stage = "intro";
-		await typewrite("let's connect your claude account.");
-		oauthError = "";
-		oauthConnecting = true;
-		try {
-			const { auth_url } = await startClaudeCliOAuth();
-			window.open(auth_url, "_blank");
-		} catch (e) {
-			oauthError = e instanceof Error ? e.message : "failed";
-		} finally {
-			oauthConnecting = false;
-		}
-		stage = "claude-oauth";
-	}
-
-	async function submitOAuthCode() {
-		const code = oauthCode.trim();
-		if (!code) return;
-		oauthError = "";
-		oauthConnecting = true;
-		try {
-			await exchangeClaudeCliOAuth(code, slug);
-			stage = "intro";
-			await typewrite("connected.");
-			await pause(400);
-			await askFirstMessage();
-		} catch (e) {
-			oauthError = e instanceof Error ? e.message : "invalid code";
-			oauthConnecting = false;
-		}
-	}
-
 	async function submitApiKey() {
 		const key = apiKeyInput.trim();
 		if (!key) return;
@@ -404,43 +354,14 @@
 				<div class="ob-enter">
 					<div class="ob-pills ob-pills-soul">
 						<button onclick={pickProviderApi} class="ob-pill ob-pill-col ob-pill-soul">
-							<span class="ob-pill-label">API key</span>
+							<span class="ob-pill-label">Anthropic</span>
 							<span class="ob-pill-note">pay-per-use</span>
-						</button>
-						<button onclick={pickProviderClaude} class="ob-pill ob-pill-col ob-pill-soul">
-							<span class="ob-pill-label">Claude Code</span>
-							<span class="ob-pill-note">Claude subscription</span>
 						</button>
 						<button onclick={pickProviderOpenai} class="ob-pill ob-pill-col ob-pill-soul">
 							<span class="ob-pill-label">OpenAI</span>
-							<span class="ob-pill-note">OpenAI API key</span>
-						</button>
-						<button onclick={pickProviderCodex} class="ob-pill ob-pill-col ob-pill-soul">
-							<span class="ob-pill-label">Codex</span>
-							<span class="ob-pill-note">ChatGPT subscription</span>
+							<span class="ob-pill-note">pay-per-use</span>
 						</button>
 					</div>
-				</div>
-			{/if}
-
-			{#if stage === "claude-oauth"}
-				<div class="ob-enter">
-					<p class="ob-hint" style="margin-bottom: 0.75rem">after authorizing in your browser, paste the code below</p>
-					<div class="ob-field">
-						<input
-							bind:value={oauthCode}
-							onkeydown={(e: KeyboardEvent) => { if (e.key === "Enter") { e.preventDefault(); submitOAuthCode(); } }}
-							placeholder="paste authorization code"
-							class="ob-input ob-input-mono"
-							type="text"
-						/>
-						{#if oauthCode.trim()}
-							<button onclick={submitOAuthCode} class="ob-go" disabled={oauthConnecting} aria-label="Submit">→</button>
-						{/if}
-					</div>
-					{#if oauthError}
-						<p class="ob-error">{oauthError}</p>
-					{/if}
 				</div>
 			{/if}
 

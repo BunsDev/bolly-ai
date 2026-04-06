@@ -181,37 +181,11 @@ export function fetchConfigStatus(): Promise<{
 	return json("/api/config/status");
 }
 
-export function updateProvider(provider: 'api' | 'claude_cli' | 'openai' | 'codex'): Promise<{ status: string; provider: string }> {
+export function updateProvider(provider: 'api' | 'openai'): Promise<{ status: string; provider: string }> {
 	return json("/api/config/provider", {
 		method: "PUT",
 		headers: { "Content-Type": "application/json" },
 		body: JSON.stringify({ provider }),
-	});
-}
-
-export function fetchClaudeCliStatus(instanceSlug?: string): Promise<{
-	installed: boolean;
-	version?: string;
-	cli_available: boolean;
-	authenticated: boolean;
-}> {
-	const qs = instanceSlug ? `?instance_slug=${encodeURIComponent(instanceSlug)}` : "";
-	return json(`/api/claude-cli/status${qs}`);
-}
-
-export function startClaudeCliOAuth(): Promise<{ auth_url: string }> {
-	return json("/api/claude-cli/oauth/start");
-}
-
-export function fetchByokeyStatus(): Promise<{ providers: Record<string, boolean> }> {
-	return json("/api/claude-cli/byokey-status");
-}
-
-export function exchangeClaudeCliOAuth(code: string, instanceSlug: string): Promise<{ status: string; expires_at: number }> {
-	return json("/api/claude-cli/oauth/exchange", {
-		method: "POST",
-		headers: { "Content-Type": "application/json" },
-		body: JSON.stringify({ code, instance_slug: instanceSlug }),
 	});
 }
 

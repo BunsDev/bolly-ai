@@ -26,7 +26,7 @@ use agent_loop::{agent_loop, collect_tool_defs, streaming_agent_loop};
 use anthropic::{anthropic_complete, anthropic_headers};
 use helpers::retry_on_rate_limit;
 use openai::openai_complete;
-use types::{ANTHROPIC_BASE_URL, BYOKEY_BASE_URL, OPENAI_BASE_URL};
+use types::{ANTHROPIC_BASE_URL, OPENAI_BASE_URL};
 
 impl LlmBackend {
     pub fn from_config(config: &Config) -> Option<Self> {
@@ -44,16 +44,6 @@ impl LlmBackend {
                     provider: crate::config::LlmProvider::Api,
                 })
             }
-            crate::config::LlmProvider::ClaudeCli => {
-                // BYOKEY proxy: Anthropic API format on localhost
-                Some(Self {
-                    http,
-                    api_key: "byokey".to_string(),
-                    model,
-                    base_url: BYOKEY_BASE_URL.to_string(),
-                    provider: crate::config::LlmProvider::ClaudeCli,
-                })
-            }
             crate::config::LlmProvider::Openai => {
                 let api_key = if config.llm.tokens.open_ai.is_empty() {
                     return None;
@@ -68,23 +58,7 @@ impl LlmBackend {
                     provider: crate::config::LlmProvider::Openai,
                 })
             }
-            crate::config::LlmProvider::Codex => {
-                // BYOKEY proxy: OpenAI format on localhost
-                Some(Self {
-                    http,
-                    api_key: "byokey".to_string(),
-                    model,
-                    base_url: BYOKEY_BASE_URL.to_string(),
-                    provider: crate::config::LlmProvider::Codex,
-                })
-            }
         }
-    }
-
-    /// Whether this backend uses the Meridian proxy (Claude subscription).
-    #[allow(dead_code)]
-    pub fn is_cli(&self) -> bool {
-        matches!(self.provider, crate::config::LlmProvider::ClaudeCli)
     }
 
     /// Create a variant using the fast model.
@@ -219,9 +193,8 @@ impl LlmBackend {
                 let prompt = prompt.clone();
                 let schema = schema.clone();
                 async move {
-                    // Include schema in prompt since Codex subscription may not
-                    // support response_format.json_schema. Use json_object mode
-                    // which is widely supported.
+                    // Include schema in prompt and use json_object mode
+                    // which is widely supported across providers.
                     let schema_str = serde_json::to_string(&schema).unwrap_or_default();
                     let messages = vec![serde_json::json!(
                         {"role": "system", "content": format!("{system}\n\nRespond with ONLY valid JSON matching this schema:\n{schema_str}")}
@@ -435,36 +408,21 @@ mod tests {
     #[test]
     fn provider_api_uses_anthropic_format() {
         assert!(!LlmProvider::Api.is_openai_format());
-        assert!(!LlmProvider::Api.is_proxy());
-    }
-
-    #[test]
-    fn provider_claude_cli_uses_anthropic_format_via_proxy() {
-        assert!(!LlmProvider::ClaudeCli.is_openai_format());
-        assert!(LlmProvider::ClaudeCli.is_proxy());
     }
 
     #[test]
     fn provider_openai_uses_openai_format() {
         assert!(LlmProvider::Openai.is_openai_format());
-        assert!(!LlmProvider::Openai.is_proxy());
-    }
-
-    #[test]
-    fn provider_codex_uses_openai_format_via_proxy() {
-        assert!(LlmProvider::Codex.is_openai_format());
-        assert!(LlmProvider::Codex.is_proxy());
     }
 
     // ── Model selection per provider ─────────────────────────────────────
 
     #[test]
-    fn anthropic_providers_use_claude_models() {
-        for provider in [LlmProvider::Api, LlmProvider::ClaudeCli] {
-            assert!(provider.heavy_model().starts_with("claude-"), "{provider:?} heavy");
-            assert!(provider.fast_model().starts_with("claude-"), "{provider:?} fast");
-            assert!(provider.cheap_model().starts_with("claude-"), "{provider:?} cheap");
-        }
+    fn anthropic_provider_uses_claude_models() {
+        let p = LlmProvider::Api;
+        assert!(p.heavy_model().starts_with("claude-"), "heavy");
+        assert!(p.fast_model().starts_with("claude-"), "fast");
+        assert!(p.cheap_model().starts_with("claude-"), "cheap");
     }
 
     #[test]
@@ -473,14 +431,6 @@ mod tests {
         assert!(p.heavy_model().starts_with("gpt-"), "heavy");
         assert!(p.fast_model().starts_with("gpt-"), "fast");
         assert!(p.cheap_model().starts_with("gpt-"), "cheap");
-    }
-
-    #[test]
-    fn codex_provider_uses_codex_prefixed_models() {
-        let p = LlmProvider::Codex;
-        assert!(p.heavy_model().starts_with("codex/"), "heavy");
-        assert!(p.fast_model().starts_with("codex/"), "fast");
-        assert!(p.cheap_model().starts_with("codex/"), "cheap");
     }
 
     // ── Backend construction ─────────────────────────────────────────────
@@ -492,9 +442,7 @@ mod tests {
             model: provider.heavy_model().to_string(),
             base_url: match provider {
                 LlmProvider::Api => ANTHROPIC_BASE_URL.to_string(),
-                LlmProvider::ClaudeCli => BYOKEY_BASE_URL.to_string(),
                 LlmProvider::Openai => OPENAI_BASE_URL.to_string(),
-                LlmProvider::Codex => BYOKEY_BASE_URL.to_string(),
             },
             provider,
         }
@@ -508,31 +456,17 @@ mod tests {
     }
 
     #[test]
-    fn backend_claude_cli_points_to_proxy() {
-        let b = make_backend(LlmProvider::ClaudeCli);
-        assert_eq!(b.base_url, "http://127.0.0.1:8018");
-        assert!(b.model.starts_with("claude-"));
-    }
-
-    #[test]
     fn backend_openai_points_to_openai() {
         let b = make_backend(LlmProvider::Openai);
         assert_eq!(b.base_url, "https://api.openai.com");
         assert!(b.model.starts_with("gpt-"));
     }
 
-    #[test]
-    fn backend_codex_points_to_proxy() {
-        let b = make_backend(LlmProvider::Codex);
-        assert_eq!(b.base_url, "http://127.0.0.1:8018");
-        assert!(b.model.starts_with("codex/"));
-    }
-
     // ── Backend variants ─────────────────────────────────────────────────
 
     #[test]
     fn fast_variant_uses_fast_model() {
-        for provider in [LlmProvider::Api, LlmProvider::ClaudeCli, LlmProvider::Openai, LlmProvider::Codex] {
+        for provider in [LlmProvider::Api, LlmProvider::Openai] {
             let b = make_backend(provider);
             let fast = b.fast_variant_with(None);
             assert_eq!(fast.model, provider.fast_model(), "{provider:?}");
@@ -556,7 +490,7 @@ mod tests {
 
     #[test]
     fn cheap_variant_uses_cheap_model() {
-        for provider in [LlmProvider::Api, LlmProvider::ClaudeCli, LlmProvider::Openai, LlmProvider::Codex] {
+        for provider in [LlmProvider::Api, LlmProvider::Openai] {
             let b = make_backend(provider);
             let cheap = b.cheap_variant();
             assert_eq!(cheap.model, provider.cheap_model(), "{provider:?}");
@@ -565,7 +499,7 @@ mod tests {
 
     #[test]
     fn heavy_variant_uses_heavy_model() {
-        for provider in [LlmProvider::Api, LlmProvider::ClaudeCli, LlmProvider::Openai, LlmProvider::Codex] {
+        for provider in [LlmProvider::Api, LlmProvider::Openai] {
             let b = make_backend(provider);
             let heavy = b.heavy_variant();
             assert_eq!(heavy.model, provider.heavy_model(), "{provider:?}");
@@ -780,24 +714,15 @@ mod tests {
 
     #[test]
     fn all_providers_have_distinct_model_tiers() {
-        for provider in [LlmProvider::Api, LlmProvider::ClaudeCli, LlmProvider::Openai, LlmProvider::Codex] {
+        for provider in [LlmProvider::Api, LlmProvider::Openai] {
             let heavy = provider.heavy_model();
             let cheap = provider.cheap_model();
-            // Heavy and cheap should be different models
             assert_ne!(heavy, cheap, "{provider:?}: heavy and cheap should differ");
         }
     }
 
     #[test]
-    fn proxy_providers_use_byokey_url() {
-        for provider in [LlmProvider::ClaudeCli, LlmProvider::Codex] {
-            let b = make_backend(provider);
-            assert_eq!(b.base_url, BYOKEY_BASE_URL, "{provider:?}");
-        }
-    }
-
-    #[test]
-    fn direct_providers_use_official_urls() {
+    fn providers_use_official_urls() {
         let api = make_backend(LlmProvider::Api);
         assert_eq!(api.base_url, ANTHROPIC_BASE_URL);
         let oai = make_backend(LlmProvider::Openai);
@@ -865,17 +790,6 @@ mod tests {
             model: model.to_string(),
             base_url: OPENAI_BASE_URL.to_string(),
             provider: LlmProvider::Openai,
-        })
-    }
-
-    fn proxy_backend(provider: LlmProvider, model: &str) -> Option<LlmBackend> {
-        std::env::var("BYOKEY_PROXY").ok().filter(|v| v == "1")?;
-        Some(LlmBackend {
-            http: reqwest::Client::new(),
-            api_key: "byokey".to_string(),
-            model: model.to_string(),
-            base_url: BYOKEY_BASE_URL.to_string(),
-            provider,
         })
     }
 
@@ -1009,35 +923,7 @@ mod tests {
         assert!(result.is_ok(), "gpt-5.x should accept max_completion_tokens: {}", result.unwrap_err());
     }
 
-    // ── ClaudeCli (BYOKEY proxy, Anthropic format) ───────────────────
-
-    #[tokio::test]
-    #[ignore] // requires BYOKEY_PROXY=1 and local proxy running
-    async fn network_claude_cli_chat() {
-        let Some(b) = proxy_backend(LlmProvider::ClaudeCli, LlmProvider::ClaudeCli.fast_model()) else {
-            eprintln!("SKIP: BYOKEY_PROXY not set");
-            return;
-        };
-        let (text, tokens) = b.chat("Reply with exactly one word: hello", "say it", vec![]).await.unwrap();
-        assert!(!text.is_empty());
-        assert!(tokens > 0);
-    }
-
-    // ── Codex (BYOKEY proxy, OpenAI format) ──────────────────────────
-
-    #[tokio::test]
-    #[ignore] // requires BYOKEY_PROXY=1 and local proxy running
-    async fn network_codex_chat() {
-        let Some(b) = proxy_backend(LlmProvider::Codex, LlmProvider::Codex.fast_model()) else {
-            eprintln!("SKIP: BYOKEY_PROXY not set");
-            return;
-        };
-        let (text, tokens) = b.chat("Reply with exactly one word: hello", "say it", vec![]).await.unwrap();
-        assert!(!text.is_empty());
-        assert!(tokens > 0);
-    }
-
-    // ── Cross-provider: same prompt, both formats ────────────────────
+    // ── Cross-provider: same prompt, both formats ─���───────���──────────
 
     #[tokio::test]
     #[ignore] // requires both ANTHROPIC_API_KEY and OPENAI_API_KEY

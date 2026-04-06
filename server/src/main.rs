@@ -52,22 +52,6 @@ async fn main() {
         }
     };
 
-    // Start Meridian proxy if using Claude subscription (child process — dies with us)
-    let _meridian = if config.llm.provider.is_proxy() {
-        services::claude_cli::kill_proxy(); // kill stale process from previous run
-        if let Err(e) = services::claude_cli::ensure_proxy_installed().await {
-            log::error!("Failed to install BYOKEY: {e}");
-            None
-        } else {
-            match services::claude_cli::start_proxy(&config::workspace_root()).await {
-                Ok(child) => Some(child),
-                Err(e) => { log::error!("Failed to start BYOKEY: {e}"); None }
-            }
-        }
-    } else {
-        None
-    };
-
     // Default public_url to localhost if not configured
     if config.public_url.is_empty() {
         config.public_url = format!("http://localhost:{port}");

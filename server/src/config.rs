@@ -200,27 +200,24 @@ impl LlmProvider {
     /// Heavy model for complex tasks.
     pub fn heavy_model(&self) -> &'static str {
         match self {
-            Self::Api | Self::ClaudeCli => "claude-opus-4-6",
+            Self::Api => "claude-opus-4-6",
             Self::Openai => "gpt-5.4",
-            Self::Codex => "codex/gpt-5.4",
         }
     }
 
     /// Fast model for casual tasks.
     pub fn fast_model(&self) -> &'static str {
         match self {
-            Self::Api | Self::ClaudeCli => "claude-sonnet-4-6",
+            Self::Api => "claude-sonnet-4-6",
             Self::Openai => "gpt-5.4",
-            Self::Codex => "codex/gpt-5.4",
         }
     }
 
     /// Cheapest model for background tasks (classification, extraction).
     pub fn cheap_model(&self) -> &'static str {
         match self {
-            Self::Api | Self::ClaudeCli => "claude-haiku-4-5-20251001",
+            Self::Api => "claude-haiku-4-5-20251001",
             Self::Openai => "gpt-5.4-mini",
-            Self::Codex => "codex/gpt-5.4-mini",
         }
     }
 }
@@ -231,23 +228,14 @@ impl LlmProvider {
 pub enum LlmProvider {
     /// Direct Anthropic API (requires API key). Format: Anthropic Messages.
     Api,
-    /// Claude subscription via BYOKEY proxy. Format: Anthropic Messages.
-    ClaudeCli,
     /// OpenAI API (requires API key). Format: OpenAI Chat Completions.
     Openai,
-    /// Codex subscription via BYOKEY proxy. Format: OpenAI Chat Completions.
-    Codex,
 }
 
 impl LlmProvider {
     /// Whether this provider uses OpenAI chat completions format (vs Anthropic messages).
     pub fn is_openai_format(&self) -> bool {
-        matches!(self, LlmProvider::Openai | LlmProvider::Codex)
-    }
-
-    /// Whether this provider routes through BYOKEY proxy.
-    pub fn is_proxy(&self) -> bool {
-        matches!(self, LlmProvider::ClaudeCli | LlmProvider::Codex)
+        matches!(self, LlmProvider::Openai)
     }
 }
 
@@ -349,7 +337,6 @@ impl LlmConfig {
         match self.provider {
             LlmProvider::Api => self.api_key().is_some(),
             LlmProvider::Openai => !self.tokens.open_ai.is_empty(),
-            LlmProvider::ClaudeCli | LlmProvider::Codex => true, // proxy handles auth
         }
     }
 
