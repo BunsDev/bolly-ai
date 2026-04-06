@@ -16,7 +16,7 @@ use super::types::{ContentBlock, Message, ToolUseBlock, StreamOnceResult};
 pub(crate) fn anthropic_headers(api_key: &str) -> reqwest::header::HeaderMap {
     let mut headers = reqwest::header::HeaderMap::new();
     headers.insert("x-api-key", api_key.parse().unwrap());
-    headers.insert("anthropic-beta", "interleaved-thinking-2025-05-14".parse().unwrap());
+    headers.insert("anthropic-beta", "interleaved-thinking-2025-05-14,compact-2026-01-12".parse().unwrap());
     headers.insert("anthropic-version", "2023-06-01".parse().unwrap());
     headers.insert("content-type", "application/json".parse().unwrap());
     headers
@@ -75,17 +75,8 @@ pub(crate) fn build_anthropic_request(
     if let Some(arr) = msgs.as_array_mut() {
         for msg in arr.iter_mut() {
             if let Some(content_arr) = msg.get_mut("content").and_then(|c| c.as_array_mut()) {
-                // Transform compaction blocks to text (APIs don't recognize "compaction" type)
-                for block in content_arr.iter_mut() {
-                    if block.get("type").and_then(|t| t.as_str()) == Some("compaction") {
-                        if let Some(content) = block.get("content").and_then(|c| c.as_str()).map(|s| s.to_string()) {
-                            *block = serde_json::json!({
-                                "type": "text",
-                                "text": format!("[Context summary from earlier conversation]\n{content}")
-                            });
-                        }
-                    }
-                }
+                // Compaction blocks are passed through as-is — the API
+                // understands them natively with the compact-2026-01-12 beta.
                 content_arr.retain(|block| {
                     let block_type = block.get("type").and_then(|t| t.as_str());
                     // Strip oversized base64 images
@@ -189,6 +180,12 @@ pub(crate) fn build_anthropic_request(
         "cache_control": {"type": "ephemeral"},
         "system": system_blocks,
         "messages": msgs,
+        "context_management": {
+            "edits": [{
+                "type": "compact_20260112",
+                "trigger": {"type": "input_tokens", "value": 100000},
+            }]
+        },
     });
 
     if !tools.is_empty() {
@@ -284,6 +281,10 @@ pub(crate) async fn anthropic_complete(
                     if let Some(s) = b["text"].as_str() {
                         text.push_str(s);
                     }
+                }
+                Some("compaction") => {
+                    // Server-side compaction — will be handled by caller
+                    log::info!("[compaction] non-streaming compaction block received");
                 }
                 Some("tool_use") => {
                     if let (Some(id), Some(name)) = (b["id"].as_str(), b["name"].as_str()) {
@@ -488,6 +489,17 @@ pub(crate) async fn anthropic_stream(
                             });
                         }
 
+                        // Compaction blocks — server-side context summary
+                        if current_block_type == "compaction" {
+                            // Flush any pending text
+                            if !current_text_block.is_empty() {
+                                ordered_content.push(ContentBlock::text(&current_text_block));
+                                current_text_block.clear();
+                            }
+                            // Content will arrive via text_delta; we'll assemble it at block_stop
+                            log::info!("[compaction] server-side compaction block started");
+                        }
+
                         if current_block_type == "tool_use" {
                             current_tool_id =
                                 block["id"].as_str().unwrap_or("").to_string();
@@ -524,14 +536,17 @@ pub(crate) async fn anthropic_stream(
                         match delta["type"].as_str() {
                             Some("text_delta") => {
                                 if let Some(t) = delta["text"].as_str() {
-                                    text.push_str(t);
                                     current_text_block.push_str(t);
-                                    let _ = events.send(ServerEvent::ChatStreamDelta {
-                                        instance_slug: instance_slug.to_string(),
-                                        chat_id: chat_id.to_string(),
-                                        message_id: message_id.to_string(),
-                                        delta: t.to_string(),
-                                    });
+                                    // Compaction text is metadata, not user-visible
+                                    if current_block_type != "compaction" {
+                                        text.push_str(t);
+                                        let _ = events.send(ServerEvent::ChatStreamDelta {
+                                            instance_slug: instance_slug.to_string(),
+                                            chat_id: chat_id.to_string(),
+                                            message_id: message_id.to_string(),
+                                            delta: t.to_string(),
+                                        });
+                                    }
                                 }
                             }
                             Some("input_json_delta") => {
@@ -557,6 +572,17 @@ pub(crate) async fn anthropic_stream(
                     // Commit completed server tool block (preserves order)
                     if let Some(block) = current_server_block.take() {
                         ordered_content.push(ContentBlock::Unknown(block));
+                    }
+                    // Compaction block complete — flush accumulated text as Compaction
+                    if current_block_type == "compaction" {
+                        let summary = std::mem::take(&mut current_text_block);
+                        if !summary.is_empty() {
+                            log::info!("[compaction] server-side summary: {} chars", summary.len());
+                            ordered_content.push(ContentBlock::Compaction { content: summary });
+                        }
+                        // Don't include compaction text in the response text
+                        // (it's metadata, not user-visible content)
+                        current_block_type.clear();
                     }
                     if current_block_type == "tool_use" {
                         let input: serde_json::Value =

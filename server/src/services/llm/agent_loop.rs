@@ -7,7 +7,7 @@ use crate::domain::events::ServerEvent;
 use crate::services::tool::{ToolDefinition, ToolDyn};
 
 use super::anthropic::{anthropic_complete, anthropic_stream};
-use super::helpers::{estimate_history_tokens, strip_context_blocks};
+use super::helpers::strip_context_blocks;
 use super::openai::{openai_complete, openai_stream};
 use super::types::{ContentBlock, HistoryEntry, LlmBackend, Message, StreamOnceResult, ToolUseBlock};
 
@@ -67,6 +67,12 @@ pub(crate) async fn agent_loop(
             continue;
         }
 
+        // Server-side compaction completed — continue with compacted context
+        if stop_reason == "compaction" {
+            log::info!("[llm] server-side compaction in non-streaming loop — continuing");
+            continue;
+        }
+
         if stop_reason != "tool_use" || tool_uses.is_empty() {
             return Ok((text, total_tokens));
         }
@@ -79,166 +85,6 @@ pub(crate) async fn agent_loop(
         }
         messages.push(Message::User { content: results });
     }
-}
-
-// ═══════════════════════════════════════════════════════════════════════════
-// Context compaction — provider-agnostic
-// ═══════════════════════════════════════════════════════════════════════════
-
-const COMPACT_TOKEN_THRESHOLD: usize = 100_000;
-const COMPACT_KEEP_MESSAGES: usize = 10;
-const COMPACT_KEEP_TOKENS: usize = 20_000;
-
-/// Flatten messages to a plain-text transcript for the summarizer.
-fn messages_to_transcript(messages: &[Message]) -> String {
-    let mut out = String::new();
-    for msg in messages {
-        let (role, content) = match msg {
-            Message::User { content } => ("User", content),
-            Message::Assistant { content } => ("Assistant", content),
-        };
-        out.push_str(&format!("\n{role}:\n"));
-        for block in content {
-            match block {
-                ContentBlock::Text { text } => {
-                    if text.starts_with("[current time:") || text.starts_with("[system: auto-recalled") {
-                        continue;
-                    }
-                    let truncated: String = text.chars().take(2000).collect();
-                    out.push_str(&truncated);
-                    out.push('\n');
-                }
-                ContentBlock::Compaction { content } => {
-                    out.push_str(&format!("[Previous summary: {content}]\n"));
-                }
-                ContentBlock::ToolUse { name, input, .. } => {
-                    let input_str: String = input.to_string().chars().take(300).collect();
-                    out.push_str(&format!("[Called tool: {name}({input_str})]\n"));
-                }
-                ContentBlock::ToolResult { content, .. } => {
-                    let s = content.as_str().unwrap_or("(non-text)");
-                    let truncated: String = s.chars().take(500).collect();
-                    out.push_str(&format!("[Tool result: {truncated}]\n"));
-                }
-                _ => {}
-            }
-        }
-    }
-    out
-}
-
-/// Compact history if it exceeds the token threshold.
-/// Returns true if compaction was performed.
-async fn maybe_compact_history(
-    backend: &LlmBackend,
-    messages: &mut Vec<Message>,
-    events: &broadcast::Sender<ServerEvent>,
-    instance_slug: &str,
-    chat_id: &str,
-    workspace_dir: &Path,
-) -> bool {
-    let total_tokens = estimate_history_tokens(messages);
-    if total_tokens < COMPACT_TOKEN_THRESHOLD {
-        return false;
-    }
-
-    log::info!(
-        "[compaction] history ~{total_tokens} tokens (threshold {COMPACT_TOKEN_THRESHOLD}) — compacting"
-    );
-
-    let msg_count = messages.len();
-
-    // Determine split point: keep recent messages from the end
-    let mut keep_from = msg_count.saturating_sub(COMPACT_KEEP_MESSAGES);
-
-    // Ensure we keep at least COMPACT_KEEP_TOKENS worth of recent context
-    let mut recent_tokens = 0usize;
-    for i in (0..msg_count).rev() {
-        recent_tokens += estimate_history_tokens(&messages[i..=i]);
-        if recent_tokens >= COMPACT_KEEP_TOKENS {
-            keep_from = keep_from.min(i);
-            break;
-        }
-    }
-
-    // Never split a tool_use/tool_result pair
-    if keep_from > 0 {
-        if let Message::User { content } = &messages[keep_from] {
-            if content.iter().any(|b| matches!(b, ContentBlock::ToolResult { .. })) {
-                keep_from -= 1;
-            }
-        }
-    }
-
-    if keep_from <= 1 {
-        log::info!("[compaction] too few messages to compact — skipping");
-        return false;
-    }
-
-    let messages_to_compact = &messages[..keep_from];
-    let compacted_count = messages_to_compact.len();
-
-    // Broadcast UI event
-    let _ = events.send(ServerEvent::ContextCompacting {
-        instance_slug: instance_slug.to_string(),
-        chat_id: chat_id.to_string(),
-        messages_compacted: compacted_count,
-    });
-
-    // Build transcript and summarize with the cheap model
-    let transcript = messages_to_transcript(messages_to_compact);
-    let system_prompt = "\
-        You are a conversation summarizer. Produce a concise summary of the conversation transcript below.\n\
-        Capture:\n\
-        1. Key facts, decisions, and user preferences\n\
-        2. Current task state and goals\n\
-        3. Important tool calls and their outcomes\n\
-        4. Pending work or unresolved questions\n\
-        Be factual and specific. Do not editorialize. Write in third person.\n\
-        Target 1000-2000 words. If there is a previous summary, incorporate it.";
-
-    let summary = match backend.chat(system_prompt, &transcript, vec![]).await {
-        Ok((text, _tokens)) => {
-            log::info!("[compaction] summary generated: {} chars", text.len());
-            text
-        }
-        Err(e) => {
-            log::error!("[compaction] summarization failed: {e} — skipping");
-            return false;
-        }
-    };
-
-    // Replace old messages with compaction block + recent messages
-    let recent: Vec<Message> = messages[keep_from..].to_vec();
-    messages.clear();
-    messages.push(Message::Assistant {
-        content: vec![ContentBlock::Compaction { content: summary }],
-    });
-    messages.extend(recent);
-
-    // Persist compacted history to disk
-    let rig_path = crate::services::chat::rig_history_path(workspace_dir, instance_slug, chat_id);
-    let ts = crate::services::tools::unix_millis().to_string();
-    let entries: Vec<HistoryEntry> = messages.iter().enumerate().map(|(i, msg)| {
-        HistoryEntry::new(msg.clone(), ts.clone(), format!("compact_{i}_{ts}"))
-    }).collect();
-    crate::services::chat::save_rig_history(&rig_path, &entries);
-
-    // Broadcast snapshot so the client immediately reflects the compacted state
-    if let Ok(resp) = crate::services::chat::load_messages(workspace_dir, instance_slug, chat_id) {
-        let _ = events.send(ServerEvent::ChatSnapshot {
-            instance_slug: instance_slug.to_string(),
-            chat_id: chat_id.to_string(),
-            messages: resp.messages,
-            agent_running: true,
-        });
-    }
-
-    log::info!(
-        "[compaction] compacted {compacted_count} messages → {} remaining",
-        messages.len(),
-    );
-    true
 }
 
 /// Streaming agent loop. Returns (final text, message_id, total tokens).
@@ -258,9 +104,6 @@ pub(crate) async fn streaming_agent_loop(
     let mut all_text = String::new();
     let mut total_tokens: u64 = 0;
     let mut current_message_id = crate::services::chat::next_id();
-
-    // Pre-call compaction: summarize old messages if context is too large
-    maybe_compact_history(backend, messages, events, instance_slug, chat_id, workspace_dir).await;
 
     loop {
         let turn = stream_once(
@@ -305,6 +148,38 @@ pub(crate) async fn streaming_agent_loop(
         if stop_reason == "pause_turn" {
             log::info!("[llm] pause_turn — code execution in progress, continuing...");
             all_text.push_str(&turn_text);
+            continue;
+        }
+
+        // compaction: server-side compaction completed — continue with compacted context
+        if stop_reason == "compaction" {
+            log::info!("[llm] server-side compaction — continuing with compacted context");
+            all_text.push_str(&turn_text);
+
+            // Broadcast compaction event to UI
+            let _ = events.send(ServerEvent::ContextCompacting {
+                instance_slug: instance_slug.to_string(),
+                chat_id: chat_id.to_string(),
+                messages_compacted: messages.len(),
+            });
+
+            // Persist compacted history to disk
+            let rig_path = crate::services::chat::rig_history_path(workspace_dir, instance_slug, chat_id);
+            let ts = crate::services::tools::unix_millis().to_string();
+            let entries: Vec<HistoryEntry> = messages.iter().enumerate().map(|(i, msg)| {
+                HistoryEntry::new(msg.clone(), ts.clone(), format!("compact_{i}_{ts}"))
+            }).collect();
+            crate::services::chat::save_rig_history(&rig_path, &entries);
+
+            // Broadcast snapshot so UI reflects the compacted state
+            if let Ok(resp) = crate::services::chat::load_messages(workspace_dir, instance_slug, chat_id) {
+                let _ = events.send(ServerEvent::ChatSnapshot {
+                    instance_slug: instance_slug.to_string(),
+                    chat_id: chat_id.to_string(),
+                    messages: resp.messages,
+                    agent_running: true,
+                });
+            }
             continue;
         }
 
@@ -368,8 +243,6 @@ pub(crate) async fn streaming_agent_loop(
             });
         }
 
-        // Re-check compaction after tool cycles (long chains grow fast)
-        maybe_compact_history(backend, messages, events, instance_slug, chat_id, workspace_dir).await;
     }
 
     // -- Final assembly: file markers from send_file accumulated during the agent loop --

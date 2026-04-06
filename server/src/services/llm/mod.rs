@@ -193,23 +193,19 @@ impl LlmBackend {
                 let prompt = prompt.clone();
                 let schema = schema.clone();
                 async move {
-                    // Include schema in prompt and use json_object mode
-                    // which is widely supported across providers.
+                    // Include schema in prompt — Responses API uses text.format for structured output
                     let schema_str = serde_json::to_string(&schema).unwrap_or_default();
-                    let messages = vec![serde_json::json!(
-                        {"role": "system", "content": format!("{system}\n\nRespond with ONLY valid JSON matching this schema:\n{schema_str}")}
-                    ), serde_json::json!(
-                        {"role": "user", "content": &prompt}
-                    )];
                     let req = serde_json::json!({
                         "model": &backend.model,
-                        "max_completion_tokens": 16384,
+                        "max_output_tokens": 16384,
                         "stream": false,
-                        "messages": messages,
-                        "response_format": { "type": "json_object" },
+                        "store": false,
+                        "instructions": format!("{system}\n\nRespond with ONLY valid JSON matching this schema:\n{schema_str}"),
+                        "input": &prompt,
+                        "text": { "format": { "type": "json_object" } },
                     });
                     let resp = backend.http
-                        .post(&format!("{}/v1/chat/completions", backend.base_url))
+                        .post(&format!("{}/v1/responses", backend.base_url))
                         .header("Authorization", format!("Bearer {}", backend.api_key))
                         .header("Content-Type", "application/json")
                         .json(&req)
@@ -221,10 +217,13 @@ impl LlmBackend {
                         return Err(anyhow::anyhow!("OpenAI API error {status}: {resp_text}"));
                     }
                     let resp_json: serde_json::Value = serde_json::from_str(&resp_text)?;
-                    let tokens = resp_json["usage"]["prompt_tokens"].as_u64().unwrap_or(0)
-                        + resp_json["usage"]["completion_tokens"].as_u64().unwrap_or(0);
-                    let text = resp_json["choices"][0]["message"]["content"]
-                        .as_str().unwrap_or("").to_string();
+                    let tokens = resp_json["usage"]["input_tokens"].as_u64().unwrap_or(0)
+                        + resp_json["usage"]["output_tokens"].as_u64().unwrap_or(0);
+                    // Extract text from output_text helper or first message content
+                    let text = resp_json["output_text"]
+                        .as_str()
+                        .unwrap_or("")
+                        .to_string();
                     Ok((text, tokens))
                 }
             }).await;
@@ -506,36 +505,36 @@ mod tests {
         }
     }
 
-    // ── OpenAI message conversion ────────────────────────────────────────
+    // ── OpenAI Responses API message conversion ────────────────────────
 
     #[test]
-    fn openai_messages_include_system_first() {
+    fn openai_messages_separate_instructions() {
         let msgs = vec![Message::user("hello")];
-        let oai = openai::messages_to_openai(&["You are helpful."], &msgs);
-        assert_eq!(oai[0]["role"], "system");
-        assert_eq!(oai[0]["content"], "You are helpful.");
-        assert_eq!(oai[1]["role"], "user");
-        assert_eq!(oai[1]["content"], "hello");
+        let (instructions, input) = openai::messages_to_openai(&["You are helpful."], &msgs);
+        assert_eq!(instructions, "You are helpful.");
+        assert_eq!(input[0]["type"], "message");
+        assert_eq!(input[0]["role"], "user");
+        assert_eq!(input[0]["content"], "hello");
     }
 
     #[test]
     fn openai_messages_skip_empty_system() {
         let msgs = vec![Message::user("hi")];
-        let oai = openai::messages_to_openai(&[], &msgs);
-        assert_eq!(oai.len(), 1);
-        assert_eq!(oai[0]["role"], "user");
+        let (instructions, input) = openai::messages_to_openai(&[], &msgs);
+        assert!(instructions.is_empty());
+        assert_eq!(input.len(), 1);
+        assert_eq!(input[0]["role"], "user");
     }
 
     #[test]
     fn openai_messages_join_multiple_system_blocks() {
         let msgs = vec![Message::user("test")];
-        let oai = openai::messages_to_openai(&["block1", "block2"], &msgs);
-        assert_eq!(oai[0]["role"], "system");
-        assert_eq!(oai[0]["content"], "block1\n\nblock2");
+        let (instructions, _input) = openai::messages_to_openai(&["block1", "block2"], &msgs);
+        assert_eq!(instructions, "block1\n\nblock2");
     }
 
     #[test]
-    fn openai_messages_convert_tool_use_to_tool_calls() {
+    fn openai_messages_convert_tool_use_to_function_call() {
         let msgs = vec![Message::Assistant {
             content: vec![
                 types::ContentBlock::Text { text: "Let me search.".into() },
@@ -546,13 +545,15 @@ mod tests {
                 },
             ],
         }];
-        let oai = openai::messages_to_openai(&[], &msgs);
-        assert_eq!(oai[0]["role"], "assistant");
-        assert_eq!(oai[0]["content"], "Let me search.");
-        let tc = &oai[0]["tool_calls"][0];
-        assert_eq!(tc["id"], "call_1");
-        assert_eq!(tc["type"], "function");
-        assert_eq!(tc["function"]["name"], "web_search");
+        let (_instructions, input) = openai::messages_to_openai(&[], &msgs);
+        // Text becomes a message item
+        assert_eq!(input[0]["type"], "message");
+        assert_eq!(input[0]["role"], "assistant");
+        assert_eq!(input[0]["content"], "Let me search.");
+        // Tool use becomes a function_call item
+        assert_eq!(input[1]["type"], "function_call");
+        assert_eq!(input[1]["call_id"], "call_1");
+        assert_eq!(input[1]["name"], "web_search");
     }
 
     #[test]
@@ -563,13 +564,13 @@ mod tests {
                 content: serde_json::json!("result text"),
             }],
         }];
-        let oai = openai::messages_to_openai(&[], &msgs);
-        assert_eq!(oai[0]["role"], "tool");
-        assert_eq!(oai[0]["tool_call_id"], "call_1");
-        assert_eq!(oai[0]["content"], "result text");
+        let (_instructions, input) = openai::messages_to_openai(&[], &msgs);
+        assert_eq!(input[0]["type"], "function_call_output");
+        assert_eq!(input[0]["call_id"], "call_1");
+        assert_eq!(input[0]["output"], "result text");
     }
 
-    // ── OpenAI tool conversion ───────────────────────────────────────────
+    // ── OpenAI Responses API tool conversion ────────────────────────────
 
     #[test]
     fn openai_tools_use_function_format() {
@@ -581,12 +582,24 @@ mod tests {
                 "properties": { "city": { "type": "string" } }
             }),
         }];
-        let oai = openai::tools_to_openai(&defs);
+        let oai = openai::tools_to_openai(&defs, false);
         assert_eq!(oai.len(), 1);
         assert_eq!(oai[0]["type"], "function");
-        assert_eq!(oai[0]["function"]["name"], "get_weather");
-        assert_eq!(oai[0]["function"]["description"], "Get weather for a city");
-        assert!(oai[0]["function"]["parameters"]["properties"]["city"].is_object());
+        assert_eq!(oai[0]["name"], "get_weather");
+        assert_eq!(oai[0]["description"], "Get weather for a city");
+        assert!(oai[0]["parameters"]["properties"]["city"].is_object());
+    }
+
+    #[test]
+    fn openai_streaming_tools_include_web_search() {
+        let defs = vec![ToolDefinition {
+            name: "my_tool".into(),
+            description: "test".into(),
+            parameters: serde_json::json!({"type": "object"}),
+        }];
+        let oai = openai::tools_to_openai(&defs, true);
+        assert_eq!(oai.len(), 2); // my_tool + web_search
+        assert_eq!(oai[1]["type"], "web_search");
     }
 
     // ── Anthropic request building ───────────────────────────────────────

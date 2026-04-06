@@ -113,27 +113,6 @@ pub(crate) fn strip_context_blocks(msg: &Message) -> Message {
     }
 }
 
-/// Estimate total tokens in a message history (~3 chars per token).
-pub(crate) fn estimate_history_tokens(messages: &[Message]) -> usize {
-    let chars: usize = messages.iter().map(|m| {
-        let content = match m {
-            Message::User { content } | Message::Assistant { content } => content,
-        };
-        content.iter().map(|block| match block {
-            ContentBlock::Text { text } => text.len(),
-            ContentBlock::Compaction { content } => content.len(),
-            ContentBlock::ToolResult { content, .. } => {
-                content.as_str().map(|s| s.len()).unwrap_or(0)
-            }
-            ContentBlock::ToolUse { name, input, .. } => {
-                name.len() + input.to_string().len()
-            }
-            _ => 0,
-        }).sum::<usize>()
-    }).sum();
-    chars / 3
-}
-
 /// Convert HistoryEntry slice to ChatMessage vec for UI display.
 pub fn history_to_chat_messages(entries: &[HistoryEntry]) -> Vec<ChatMessage> {
 
