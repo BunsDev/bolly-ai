@@ -4,6 +4,7 @@ use tokio::sync::broadcast;
 use crate::domain::events::ServerEvent;
 use crate::services::tool::ToolDefinition;
 
+use super::helpers::cache_real_input_tokens;
 use super::types::{ContentBlock, ImageSource, Message, ToolUseBlock, StreamOnceResult};
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -241,7 +242,11 @@ pub(crate) async fn openai_complete(
 
     let input_tokens = resp_json["usage"]["input_tokens"].as_u64().unwrap_or(0);
     let output_tokens = resp_json["usage"]["output_tokens"].as_u64().unwrap_or(0);
-    let tokens_used = (output_tokens as f64 + input_tokens as f64 * 0.2) as u64;
+    let cached_tokens = resp_json["usage"]["input_tokens_details"]["cached_tokens"].as_u64().unwrap_or(0);
+    let uncached_tokens = input_tokens.saturating_sub(cached_tokens);
+    let tokens_used = (output_tokens as f64
+        + uncached_tokens as f64 * 0.2
+        + cached_tokens as f64 * 0.1) as u64;
 
     Ok((text, tool_uses, stop_reason, tokens_used))
 }
@@ -438,11 +443,21 @@ pub(crate) async fn openai_stream(
                             }
                         }
 
-                        // Usage
+                        // Usage — includes prompt caching details
                         if let Some(usage) = response.get("usage") {
                             let input_t = usage["input_tokens"].as_u64().unwrap_or(0);
                             let output_t = usage["output_tokens"].as_u64().unwrap_or(0);
-                            tokens_used = (output_t as f64 + input_t as f64 * 0.2) as u64;
+                            let cached_t = usage["input_tokens_details"]["cached_tokens"].as_u64().unwrap_or(0);
+                            let uncached_t = input_t.saturating_sub(cached_t);
+                            log::info!(
+                                "openai usage: input={} (cached={} uncached={}) output={}",
+                                input_t, cached_t, uncached_t, output_t,
+                            );
+                            cache_real_input_tokens(instance_slug, chat_id, input_t);
+                            // Normalize: cached input is ~50% cheaper on OpenAI
+                            tokens_used = (output_t as f64
+                                + uncached_t as f64 * 0.2
+                                + cached_t as f64 * 0.1) as u64;
                         }
                     }
                 }
